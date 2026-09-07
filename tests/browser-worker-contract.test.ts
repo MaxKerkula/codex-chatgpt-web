@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Page } from "playwright-core";
-import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, CHATGPT_STOPPED_THINKING_GRACE_MS, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptStoppedThinkingTracker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
+import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, CHATGPT_STOPPED_THINKING_GRACE_MS, CHATGPT_STOPPED_THINKING_RUNNING_CEILING_MS, chatGptStoppedThinkingEndsTurn, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptStoppedThinkingTracker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
 import { ensureChatGptPersonalizedConnectorAccess } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
@@ -3236,9 +3236,14 @@ test("the launcher helper transport carries MCP progress into the out-of-process
 
 test("turn cancellation heuristics defer to proven MCP progress in both wait loops", () => {
   const worker = readFileSync("src/adapters/chatgpt-web/browser-worker.ts", "utf8");
-  // A stale "Stopped thinking" label must not cancel a turn that is still driving tool calls, and
-  // the multipart staging loop must not be the one place that skips the liveness guard.
-  expect((worker.match(/stoppedThinkingTracker\.clear\(\)/g) ?? []).length).toBe(2);
+  // A stale "Stopped thinking" label must not cancel a turn that is still driving tool calls or is
+  // still visibly generating, and the multipart staging loop must not be the one place that skips
+  // the liveness guard. Both loops route that decision through the one shared helper, which is the
+  // only thing that clears or suspends the window, so neither loop may clear it directly.
+  // This is a source grep and cannot prove that either loop passes the freshly read stop button
+  // rather than a constant; the helper's own behaviour is covered by the unit tests above.
+  expect((worker.match(/chatGptStoppedThinkingEndsTurn\(stoppedThinkingTracker, \{/g) ?? []).length).toBe(2);
+  expect((worker.match(/stoppedThinkingTracker\.clear\(\)/g) ?? []).length).toBe(0);
   expect((worker.match(/domHealthTracker\.clearMissingResponse\(\)/g) ?? []).length).toBe(2);
 });
 
@@ -3372,6 +3377,152 @@ test("the daemon prefers the browser helper that shipped beside its own entrypoi
   expect(helper).toContain("discarded an invalid MCP progress frame");
 });
 
+
+test("the production 65s cancellation is replayed and gone, at the real constants", () => {
+  // The turn this fixes: last MCP tool result at t=0, ChatGPT still generating with a stale
+  // "Stopped thinking" label and no further tool calls. Production cancelled it at 65.5s. This
+  // drives the real gate at the loop's real 250ms cadence rather than asserting on constants.
+  const replay = (
+    decide: (
+      tracker: ChatGptStoppedThinkingTracker,
+      state: { stoppedThinkingVisible: boolean; externalProgressLive: boolean; running: boolean | undefined },
+      now: number,
+    ) => boolean,
+    running: boolean | undefined,
+    untilMs: number,
+  ): number | undefined => {
+    const tracker = new ChatGptStoppedThinkingTracker();
+    for (let now = 0; now <= untilMs; now += 250) {
+      const externalProgressLive = chatGptExternalProgressSuppressesDomHealth(
+        { revision: 1, lastToolBatchRevision: 1, activeToolCalls: 0, lastProgressAt: 0 },
+        now,
+      );
+      if (decide(tracker, { stoppedThinkingVisible: true, externalProgressLive, running }, now)) return now;
+    }
+    return undefined;
+  };
+
+  // The v5.0.4 decision verbatim: the stop button existed in the loop but was read afterwards.
+  const preFix = (
+    tracker: ChatGptStoppedThinkingTracker,
+    state: { stoppedThinkingVisible: boolean; externalProgressLive: boolean; running: boolean | undefined },
+    now: number,
+  ): boolean => {
+    if (state.externalProgressLive) {
+      tracker.clear();
+      return false;
+    }
+    return tracker.update(state.stoppedThinkingVisible, now);
+  };
+
+  // What shipped in v5.0.4: cancelled while ChatGPT was still generating.
+  expect(replay(preFix, true, 20 * 60_000)).toBe(
+    CHATGPT_RESPONSE_DOM_GRACE_MS + CHATGPT_STOPPED_THINKING_GRACE_MS,
+  );
+  expect(replay(preFix, true, 20 * 60_000)).toBe(65_000);
+
+  // The same turn now survives the window that killed it, and keeps surviving.
+  expect(replay(chatGptStoppedThinkingEndsTurn, true, 65_000)).toBeUndefined();
+  expect(replay(chatGptStoppedThinkingEndsTurn, true, 9 * 60_000)).toBeUndefined();
+
+  // A wedged tab still dies. Suspension starts when proven progress goes stale at the 60s grace,
+  // not at turn start, so the total bound is that grace plus the ceiling.
+  expect(replay(chatGptStoppedThinkingEndsTurn, true, 30 * 60_000)).toBe(
+    CHATGPT_RESPONSE_DOM_GRACE_MS + CHATGPT_STOPPED_THINKING_RUNNING_CEILING_MS,
+  );
+
+  // A ChatGPT that genuinely stopped is still cancelled on the original timeline.
+  expect(replay(chatGptStoppedThinkingEndsTurn, false, 20 * 60_000)).toBe(65_000);
+
+  // An unreadable stop button is suspended rather than read as stopped, under the same bound.
+  expect(replay(chatGptStoppedThinkingEndsTurn, undefined, 9 * 60_000)).toBeUndefined();
+  expect(replay(chatGptStoppedThinkingEndsTurn, undefined, 30 * 60_000)).toBe(
+    CHATGPT_RESPONSE_DOM_GRACE_MS + CHATGPT_STOPPED_THINKING_RUNNING_CEILING_MS,
+  );
+});
+
+test("a visible stop button suspends Stopped thinking instead of cancelling a live turn", () => {
+  const tracker = new ChatGptStoppedThinkingTracker(5_000, 600_000);
+  const decide = (
+    state: { stoppedThinkingVisible: boolean; externalProgressLive: boolean; running: boolean | undefined },
+    now: number,
+  ): boolean => chatGptStoppedThinkingEndsTurn(tracker, state, now);
+
+  // ChatGPT is between steps: the last tool result is older than the progress grace, so MCP no
+  // longer vouches for the turn, but its own stop button says the model has not stopped. This is
+  // the production timeline, which cancelled at 65s.
+  const between = { stoppedThinkingVisible: true, externalProgressLive: false, running: true };
+  expect(decide(between, 1_000)).toBeFalse();
+  expect(decide(between, 65_000)).toBeFalse();
+  expect(decide(between, 599_999)).toBeFalse();
+
+  // Suspension is not a licence to hang: unproven liveness expires a ceiling after it began,
+  // which is the first suspended observation at 1_000, not the turn's start.
+  expect(decide(between, 600_999)).toBeFalse();
+  expect(decide(between, 601_000)).toBeTrue();
+
+  // One completed tool call refreshes the claim, so a working turn never reaches the ceiling.
+  const working = { stoppedThinkingVisible: true, externalProgressLive: true, running: true };
+  expect(decide(working, 601_001)).toBeFalse();
+  expect(decide(between, 700_000)).toBeFalse();
+  expect(decide(between, 1_299_999)).toBeFalse();
+  expect(decide(between, 1_300_000)).toBeTrue();
+});
+
+test("the running ceiling is the only bound on a wedged tab, so it must be finite", () => {
+  // Every other DOM-health verdict requires !running, no absolute turn deadline is set by default,
+  // and the bridge's stall budget is a silence timer this adapter refreshes with its own heartbeat.
+  expect(Number.isFinite(CHATGPT_STOPPED_THINKING_RUNNING_CEILING_MS)).toBeTrue();
+  expect(CHATGPT_STOPPED_THINKING_RUNNING_CEILING_MS).toBeGreaterThan(CHATGPT_STOPPED_THINKING_GRACE_MS);
+  expect(CHATGPT_STOPPED_THINKING_RUNNING_CEILING_MS).toBe(600_000);
+
+  // A stop button stuck visible forever, with no proven progress, still ends the turn.
+  const wedged = new ChatGptStoppedThinkingTracker();
+  const stuck = { stoppedThinkingVisible: true, externalProgressLive: false, running: true };
+  expect(chatGptStoppedThinkingEndsTurn(wedged, stuck, 0)).toBeFalse();
+  expect(chatGptStoppedThinkingEndsTurn(wedged, stuck, CHATGPT_STOPPED_THINKING_RUNNING_CEILING_MS))
+    .toBeTrue();
+});
+
+test("an unreadable stop button never counts as evidence that ChatGPT stopped", () => {
+  // The read is wrapped in .catch(); a fault there used to read as "not running", which re-armed
+  // the guard exactly when the page handle was least trustworthy, such as during a rebind.
+  const tracker = new ChatGptStoppedThinkingTracker(5_000, 600_000);
+  const unreadable = {
+    stoppedThinkingVisible: true,
+    externalProgressLive: false,
+    running: undefined,
+  };
+  expect(chatGptStoppedThinkingEndsTurn(tracker, unreadable, 1_000)).toBeFalse();
+  expect(chatGptStoppedThinkingEndsTurn(tracker, unreadable, 30_000)).toBeFalse();
+
+  // It is suspension, not immunity: the same ceiling applies.
+  expect(chatGptStoppedThinkingEndsTurn(tracker, unreadable, 601_001)).toBeTrue();
+});
+
+test("Stopped thinking still cancels a turn ChatGPT has genuinely abandoned", () => {
+  const tracker = new ChatGptStoppedThinkingTracker(5_000);
+  const stopped = { stoppedThinkingVisible: true, externalProgressLive: false, running: false };
+  expect(chatGptStoppedThinkingEndsTurn(tracker, stopped, 1_000)).toBeFalse();
+  expect(chatGptStoppedThinkingEndsTurn(tracker, stopped, 5_999)).toBeFalse();
+  expect(chatGptStoppedThinkingEndsTurn(tracker, stopped, 6_000)).toBeTrue();
+
+  // Proven MCP activity keeps its existing veto even with no stop button on screen.
+  const working = { stoppedThinkingVisible: true, externalProgressLive: true, running: false };
+  expect(chatGptStoppedThinkingEndsTurn(new ChatGptStoppedThinkingTracker(5_000), working, 60_000))
+    .toBeFalse();
+
+  // A turn with no label is never cancelled by this guard, however long it runs.
+  const quiet = { stoppedThinkingVisible: false, externalProgressLive: false, running: false };
+  expect(chatGptStoppedThinkingEndsTurn(new ChatGptStoppedThinkingTracker(5_000), quiet, 600_000))
+    .toBeFalse();
+
+  // Nor is a suspended turn cancelled at the ceiling when the label is not actually up.
+  const ceilinged = new ChatGptStoppedThinkingTracker(5_000, 1_000);
+  const quietRunning = { stoppedThinkingVisible: false, externalProgressLive: false, running: true };
+  expect(chatGptStoppedThinkingEndsTurn(ceilinged, quietRunning, 0)).toBeFalse();
+  expect(chatGptStoppedThinkingEndsTurn(ceilinged, quietRunning, 5_000)).toBeFalse();
+});
 
 test("proven progress forgets a Stopped thinking window rather than merely ignoring it", () => {
   const tracker = new ChatGptStoppedThinkingTracker(5_000);

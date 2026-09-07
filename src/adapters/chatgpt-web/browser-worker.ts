@@ -1507,11 +1507,23 @@ export function chatGptExternalProgressSuppressesDomHealth(
     && age < CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS;
 }
 
+/**
+ * How long a still-generating ChatGPT may hold the turn without any proven progress.
+ *
+ * A visible stop button is the renderer describing itself, so it is weaker evidence than a
+ * completed tool call and cannot be trusted without end. This mirrors
+ * {@link CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS}, which exists because a call that never
+ * returns would otherwise hold a turn open forever; a stop button that never clears does the same.
+ * Past this bound the DOM decides again, so a wedged tab fails instead of hanging.
+ */
+export const CHATGPT_STOPPED_THINKING_RUNNING_CEILING_MS = 10 * 60_000;
+
 export class ChatGptStoppedThinkingTracker {
   private visibleSince?: number;
+  private suppressedSince?: number;
 
   /**
-   * Forgets an in-progress "Stopped thinking" window.
+   * Forgets an in-progress "Stopped thinking" window and the suppression holding it open.
    *
    * Suppressing only the throw let the window keep accruing while a tool call was outstanding, so
    * the first observation after progress ended cancelled the turn instantly. Proven activity must
@@ -1519,12 +1531,31 @@ export class ChatGptStoppedThinkingTracker {
    */
   clear(): void {
     this.visibleSince = undefined;
+    this.suppressedSince = undefined;
   }
 
-  constructor(private readonly graceMs = CHATGPT_STOPPED_THINKING_GRACE_MS) {
+  constructor(
+    private readonly graceMs = CHATGPT_STOPPED_THINKING_GRACE_MS,
+    private readonly runningCeilingMs = CHATGPT_STOPPED_THINKING_RUNNING_CEILING_MS,
+  ) {
     if (!Number.isFinite(graceMs) || graceMs < 0) {
       throw new Error("ChatGPT Stopped thinking grace must be a non-negative finite number");
     }
+    if (!Number.isFinite(runningCeilingMs) || runningCeilingMs < 0) {
+      throw new Error("ChatGPT Stopped thinking running ceiling must be a non-negative finite number");
+    }
+  }
+
+  /**
+   * Hold the window open on unproven liveness, and report when that has gone on too long.
+   *
+   * Returns true once the claim has stood for the ceiling without one piece of proven progress to
+   * refresh it, at which point the caller may act on the label after all.
+   */
+  suppress(now = Date.now()): boolean {
+    this.visibleSince = undefined;
+    this.suppressedSince ??= now;
+    return now - this.suppressedSince >= this.runningCeilingMs;
   }
 
   update(visible: boolean, now = Date.now()): boolean {
@@ -1535,6 +1566,41 @@ export class ChatGptStoppedThinkingTracker {
     this.visibleSince ??= now;
     return now - this.visibleSince >= this.graceMs;
   }
+}
+
+/**
+ * Decide whether a visible "Stopped thinking" label may end the turn.
+ *
+ * The error this guards asserts that ChatGPT stopped producing the turn. Proven MCP activity
+ * disproves that outright and forgets the window, so the first observation after a tool call ends
+ * cannot cancel instantly. Both loops used to reach this decision before they had read the stop
+ * button and never consulted it, so a model pausing longer than the progress grace between tool
+ * calls was cancelled while it was still generating.
+ *
+ * A visible stop button is weaker evidence: the renderer describing itself, which is exactly what
+ * a wedged tab gets wrong. It therefore suspends the window under a ceiling rather than clearing
+ * it. Nothing else would end such a turn - every other DOM-health verdict requires `!running`, no
+ * absolute deadline is set by default, and the bridge's stall budget is a silence timer that this
+ * adapter refreshes with its own heartbeat - so this ceiling is the only bound that exists.
+ *
+ * `running` is undefined when the stop button could not be read. A failed read is not evidence
+ * that ChatGPT stopped, so it suspends too; only a confirmed absence lets the window run.
+ */
+export function chatGptStoppedThinkingEndsTurn(
+  tracker: ChatGptStoppedThinkingTracker,
+  state: {
+    stoppedThinkingVisible: boolean;
+    externalProgressLive: boolean;
+    running: boolean | undefined;
+  },
+  now = Date.now(),
+): boolean {
+  if (state.externalProgressLive) {
+    tracker.clear();
+    return false;
+  }
+  if (state.running !== false) return tracker.suppress(now) && state.stoppedThinkingVisible;
+  return tracker.update(state.stoppedThinkingVisible, now);
 }
 
 export interface ChatGptVisibleTraceBlock {
@@ -3372,8 +3438,13 @@ export class ChatGptBrowserWorker {
         Date.now(),
       );
       const externalToolCallsInFlight = chatGptExternalToolCallsAreInFlight(externalProgressSnapshot);
-      if (externalProgressLive) stoppedThinkingTracker.clear();
-      else if (stoppedThinkingTracker.update(snapshot.stoppedThinkingVisible)) {
+      const running = await page.locator(CHATGPT_STOP_BUTTON_SELECTOR).last().isVisible()
+        .catch((): boolean | undefined => undefined);
+      if (chatGptStoppedThinkingEndsTurn(stoppedThinkingTracker, {
+        stoppedThinkingVisible: snapshot.stoppedThinkingVisible,
+        externalProgressLive,
+        running,
+      })) {
         throw chatGptStoppedThinkingError();
       }
       if (!snapshot.responsePresent && externalProgressLive) {
@@ -3383,10 +3454,9 @@ export class ChatGptBrowserWorker {
         await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
         continue;
       }
-      const running = await page.locator(CHATGPT_STOP_BUTTON_SELECTOR).last().isVisible().catch(() => false);
       const domError = domHealthTracker.update({
         responsePresent: snapshot.responsePresent,
-        running,
+        running: running === true,
         currentText: snapshot.visibleText,
         completionActionVisible: snapshot.completionActionVisible,
         externalProgressLive,
@@ -3394,7 +3464,7 @@ export class ChatGptBrowserWorker {
       if (domError) throw new Error(domError);
       if (completionTracker.update({
         responsePresent: snapshot.responsePresent,
-        running,
+        running: running === true,
         currentText: snapshot.visibleText,
         currentHtml: snapshot.fullHtml,
         completionActionVisible: snapshot.completionActionVisible,
@@ -4743,10 +4813,13 @@ export class ChatGptBrowserWorker {
           Date.now(),
         );
         const externalToolCallsInFlight = chatGptExternalToolCallsAreInFlight(externalProgressSnapshot);
-        // A stale "Stopped thinking" label is not terminal while the model is still driving tool
-        // calls, and the window must be forgotten rather than merely ignored.
-        if (externalProgressLive) stoppedThinkingTracker.clear();
-        else if (stoppedThinkingTracker.update(snapshot.stoppedThinkingVisible)) {
+        const stop = page.locator(CHATGPT_STOP_BUTTON_SELECTOR).last();
+        const running = await stop.isVisible().catch((): boolean | undefined => undefined);
+        if (chatGptStoppedThinkingEndsTurn(stoppedThinkingTracker, {
+          stoppedThinkingVisible: snapshot.stoppedThinkingVisible,
+          externalProgressLive,
+          running,
+        })) {
           throw chatGptStoppedThinkingError();
         }
         if (!snapshot.responsePresent && externalProgressLive) {
@@ -4757,8 +4830,6 @@ export class ChatGptBrowserWorker {
           await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
           continue;
         }
-        const stop = page.locator(CHATGPT_STOP_BUTTON_SELECTOR).last();
-        const running = await stop.isVisible().catch(() => false);
         if (running) sawRunning = true;
         if (snapshot.responsePresent) {
           if (!capturedResponse) {
@@ -4779,7 +4850,7 @@ export class ChatGptBrowserWorker {
           if (textDelta) emitMarkdownDelta(textDelta);
           const domError = domHealthTracker.update({
             responsePresent: snapshot.responsePresent,
-            running,
+            running: running === true,
             currentText: snapshot.visibleText,
             completionActionVisible: snapshot.completionActionVisible,
             externalProgressLive,
@@ -4787,7 +4858,7 @@ export class ChatGptBrowserWorker {
           if (domError) throw new Error(domError);
           const completionReady = completionTracker.update({
             responsePresent: snapshot.responsePresent,
-            running,
+            running: running === true,
             currentText: snapshot.visibleText,
             currentHtml: snapshot.fullHtml,
             completionActionVisible: snapshot.completionActionVisible,
@@ -4857,7 +4928,7 @@ export class ChatGptBrowserWorker {
         } else {
           const domError = domHealthTracker.update({
             responsePresent: false,
-            running,
+            running: running === true,
             currentText: "",
             completionActionVisible: false,
             externalProgressLive,
