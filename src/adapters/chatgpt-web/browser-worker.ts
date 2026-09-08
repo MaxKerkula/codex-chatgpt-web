@@ -769,6 +769,61 @@ export async function throwIfChatGptTerminalErrorAlert(scope: ChatGptTextScope):
   );
 }
 
+/**
+ * ChatGPT's own notice that it has queued the request behind its normal latency.
+ *
+ * It renders outside the assistant turn, so the response-DOM snapshot never sees it: the turn just
+ * looks like a model that produced no text and exposed no completion action. Every stall verdict
+ * here means "ChatGPT stopped producing this turn", and this notice is ChatGPT stating the exact
+ * opposite, so it has to be read before any of them fire.
+ */
+const chatGptDeferredResponseNotice = (scope: ChatGptTextScope): Locator => scope
+  .getByText(/systems are thinking a bit more about this request/i)
+  .last();
+
+export async function chatGptDeferredResponseVisible(scope: ChatGptTextScope): Promise<boolean> {
+  return chatGptDeferredResponseNotice(scope).isVisible().catch(() => false);
+}
+
+export function chatGptDeferredResponseError(): ChatGptWebAdapterError {
+  return new ChatGptWebAdapterError(
+    "ChatGPT deferred this request (\"Our systems are thinking a bit more about this request before "
+    + "responding\") and never started answering. Retry, or pick a faster reasoning effort.",
+    { status: 504, errorType: "server_error", code: "chatgpt_response_deferred", retryable: true },
+  );
+}
+
+/** How long ChatGPT may claim it is still deliberating without producing anything. */
+export const CHATGPT_DEFERRED_RESPONSE_CEILING_MS = 10 * 60_000;
+
+/**
+ * Bound a deferral the same way liveness is bounded elsewhere: the notice keeps the turn alive,
+ * but it cannot keep it alive forever, and it is forgotten as soon as ChatGPT starts producing.
+ */
+export class ChatGptDeferredResponseTracker {
+  private since?: number;
+
+  constructor(private readonly ceilingMs = CHATGPT_DEFERRED_RESPONSE_CEILING_MS) {
+    if (!Number.isFinite(ceilingMs) || ceilingMs < 0) {
+      throw new Error("ChatGPT deferred response ceiling must be a non-negative finite number");
+    }
+  }
+
+  clear(): void {
+    this.since = undefined;
+  }
+
+  /** Record a deferred observation; true once it has outlived the ceiling. */
+  observe(now = Date.now()): boolean {
+    this.since ??= now;
+    return now - this.since >= this.ceilingMs;
+  }
+
+  get active(): boolean {
+    return this.since !== undefined;
+  }
+}
+
 export async function resolveChatGptToolConfirmation(
   page: Page,
   appName: string,
@@ -4707,6 +4762,8 @@ export class ChatGptBrowserWorker {
       };
       const domHealthTracker = new ChatGptTurnDomHealthTracker();
       const stoppedThinkingTracker = new ChatGptStoppedThinkingTracker();
+      const deferredResponseTracker = new ChatGptDeferredResponseTracker();
+      let announcedDeferral = false;
       const responseDomCache: ChatGptResponseDomCache = {};
       let consecutiveObservationRebinds = 0;
       let internalObservationFaults = 0;
@@ -4815,6 +4872,27 @@ export class ChatGptBrowserWorker {
         const externalToolCallsInFlight = chatGptExternalToolCallsAreInFlight(externalProgressSnapshot);
         const stop = page.locator(CHATGPT_STOP_BUTTON_SELECTOR).last();
         const running = await stop.isVisible().catch((): boolean | undefined => undefined);
+        // Only a turn that looks stalled is worth a DOM query for the notice, which keeps this off
+        // the hot path: a turn producing text or showing its completion action is never deferred.
+        if (!snapshot.completionActionVisible && snapshot.visibleText.length === 0
+          && await chatGptDeferredResponseVisible(page)) {
+          if (deferredResponseTracker.observe()) throw chatGptDeferredResponseError();
+          if (!announcedDeferral) {
+            announcedDeferral = true;
+            // Silence is the actual complaint here: without this the turn shows tool calls, then an
+            // error, and never says ChatGPT was the one waiting.
+            console.warn(`[chatgpt-web] browser turn ${turn.traceId} deferred by ChatGPT; still waiting`);
+            turn.onCommentary?.(
+              "ChatGPT queued this request behind its normal latency and has not started answering yet.",
+              false,
+            );
+          }
+          stoppedThinkingTracker.clear();
+          domHealthTracker.clearMissingResponse();
+          await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
+          continue;
+        }
+        deferredResponseTracker.clear();
         if (chatGptStoppedThinkingEndsTurn(stoppedThinkingTracker, {
           stoppedThinkingVisible: snapshot.stoppedThinkingVisible,
           externalProgressLive,

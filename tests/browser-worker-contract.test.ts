@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Page } from "playwright-core";
-import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, CHATGPT_STOPPED_THINKING_GRACE_MS, CHATGPT_STOPPED_THINKING_RUNNING_CEILING_MS, chatGptStoppedThinkingEndsTurn, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptStoppedThinkingTracker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
+import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, CHATGPT_STOPPED_THINKING_GRACE_MS, CHATGPT_STOPPED_THINKING_RUNNING_CEILING_MS, CHATGPT_DEFERRED_RESPONSE_CEILING_MS, ChatGptDeferredResponseTracker, chatGptDeferredResponseError, chatGptStoppedThinkingEndsTurn, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptStoppedThinkingTracker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
 import { ensureChatGptPersonalizedConnectorAccess } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
@@ -3238,13 +3238,16 @@ test("turn cancellation heuristics defer to proven MCP progress in both wait loo
   const worker = readFileSync("src/adapters/chatgpt-web/browser-worker.ts", "utf8");
   // A stale "Stopped thinking" label must not cancel a turn that is still driving tool calls or is
   // still visibly generating, and the multipart staging loop must not be the one place that skips
-  // the liveness guard. Both loops route that decision through the one shared helper, which is the
-  // only thing that clears or suspends the window, so neither loop may clear it directly.
+  // the liveness guard. Both loops route that cancellation decision through the one shared helper.
+  // Exactly one direct clear is allowed: the main loop's deferral path, where ChatGPT has said in
+  // plain language that it is still working, which is proof of life rather than a verdict.
   // This is a source grep and cannot prove that either loop passes the freshly read stop button
   // rather than a constant; the helper's own behaviour is covered by the unit tests above.
   expect((worker.match(/chatGptStoppedThinkingEndsTurn\(stoppedThinkingTracker, \{/g) ?? []).length).toBe(2);
-  expect((worker.match(/stoppedThinkingTracker\.clear\(\)/g) ?? []).length).toBe(0);
-  expect((worker.match(/domHealthTracker\.clearMissingResponse\(\)/g) ?? []).length).toBe(2);
+  expect((worker.match(/stoppedThinkingTracker\.clear\(\)/g) ?? []).length).toBe(1);
+  // Three clears: proven MCP progress in each loop, plus the main loop's deferral path, where
+  // ChatGPT has explicitly said it is still working on a turn that otherwise looks abandoned.
+  expect((worker.match(/domHealthTracker\.clearMissingResponse\(\)/g) ?? []).length).toBe(3);
 });
 
 test("proven MCP progress vetoes every terminal DOM conclusion, not just a missing response", () => {
@@ -3377,6 +3380,56 @@ test("the daemon prefers the browser helper that shipped beside its own entrypoi
   expect(helper).toContain("discarded an invalid MCP progress frame");
 });
 
+
+test("a deferred ChatGPT keeps its turn alive, is announced, and is still bounded", () => {
+  // ChatGPT renders "Our systems are thinking a bit more about this request before responding"
+  // outside the assistant turn, so the response snapshot sees no text and no completion action --
+  // indistinguishable, to every stall verdict here, from a model that gave up. It is the opposite.
+  const tracker = new ChatGptDeferredResponseTracker(600_000);
+  expect(tracker.active).toBeFalse();
+
+  expect(tracker.observe(1_000)).toBeFalse();
+  expect(tracker.active).toBeTrue();
+  expect(tracker.observe(300_000)).toBeFalse();
+  expect(tracker.observe(600_999)).toBeFalse();
+
+  // A deferral cannot hold a turn open forever any more than a stuck stop button can.
+  expect(tracker.observe(601_000)).toBeTrue();
+
+  // Once ChatGPT starts producing, the deferral is forgotten rather than merely paused.
+  tracker.clear();
+  expect(tracker.active).toBeFalse();
+  expect(tracker.observe(700_000)).toBeFalse();
+  expect(tracker.observe(1_299_999)).toBeFalse();
+  expect(tracker.observe(1_300_000)).toBeTrue();
+});
+
+test("the deferral ceiling is finite and its error says what ChatGPT actually did", () => {
+  expect(Number.isFinite(CHATGPT_DEFERRED_RESPONSE_CEILING_MS)).toBeTrue();
+  expect(CHATGPT_DEFERRED_RESPONSE_CEILING_MS).toBe(600_000);
+  expect(() => new ChatGptDeferredResponseTracker(Number.POSITIVE_INFINITY)).toThrow();
+  expect(() => new ChatGptDeferredResponseTracker(-1)).toThrow();
+
+  const error = chatGptDeferredResponseError();
+  expect(error).toMatchObject({ status: 504, code: "chatgpt_response_deferred", retryable: true });
+  // The old failure blamed the DOM for a condition ChatGPT had stated in plain language.
+  expect(error.message).toContain("deferred this request");
+  expect(error.message).not.toContain("DOM may have changed");
+});
+
+test("the deferral probe runs only on a turn that already looks stalled", () => {
+  // Normalised: the checkout's line endings are a git setting, not a property of this contract.
+  const worker = readFileSync("src/adapters/chatgpt-web/browser-worker.ts", "utf8")
+    .split(String.fromCharCode(13)).join("");
+  // The page is large; querying it every 250ms would be a real cost. The guard conditions must
+  // short-circuit before the DOM query, and the query must precede every stall verdict.
+  expect(worker).toContain("!snapshot.completionActionVisible && snapshot.visibleText.length === 0\n"
+    + "          && await chatGptDeferredResponseVisible(page)");
+  const probe = worker.indexOf("await chatGptDeferredResponseVisible(page)");
+  const stoppedThinking = worker.indexOf("throw chatGptStoppedThinkingError();", probe);
+  expect(probe).toBeGreaterThan(0);
+  expect(stoppedThinking).toBeGreaterThan(probe);
+});
 
 test("the production 65s cancellation is replayed and gone, at the real constants", () => {
   // The turn this fixes: last MCP tool result at t=0, ChatGPT still generating with a stale
