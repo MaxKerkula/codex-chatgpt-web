@@ -27,8 +27,8 @@ function fixture(run: (root: string, invoke: (args: string[]) => { exitCode: num
   } finally { rmSync(root, { recursive: true, force: true }); }
 }
 
-for (const target of [[], ["--codex-only"], ["--claude-only"]]) {
-  test(`preflight validates ${target[0] ?? "both integrations"} without installing or inspecting a browser`, () => {
+for (const target of [[], ["--codex-only"], ["--claude-only"], ["--all-integrations"]]) {
+  test(`preflight validates ${target[0] ?? "the default Codex target"} without installing or inspecting a browser`, () => {
     fixture((_root, invoke) => {
       const result = invoke(["--browser-only", ...target]);
       expect(result.exitCode).toBe(0);
@@ -52,12 +52,24 @@ test("manual preflight requires its own tunnel and key before any setup side eff
 test("preflight honors the selected integration instead of validating an unrelated client", () => {
   fixture((root, invoke) => {
     writeFileSync(join(root, "claude/settings.json"), "{ invalid JSON");
-    expect(invoke(["--browser-only", "--codex-only"]).exitCode).toBe(0);
-    for (const target of [[], ["--claude-only"]]) {
+    for (const target of [[], ["--codex-only"]]) {
+      expect(invoke(["--browser-only", ...target]).exitCode).toBe(0);
+    }
+    for (const target of [["--claude-only"], ["--all-integrations"]]) {
       const result = invoke(["--browser-only", ...target]);
       expect(result.exitCode).not.toBe(0);
       expect(result.stderr.toString()).toContain("Claude settings");
     }
+  });
+});
+
+test("setup accepts at most one explicit integration target", () => {
+  fixture((_root, invoke) => {
+    const result = invoke(["--browser-only", "--codex-only", "--all-integrations"]);
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr.toString()).toContain(
+      "Choose at most one integration target: --codex-only, --claude-only, or --all-integrations",
+    );
   });
 });
 
@@ -85,7 +97,7 @@ for (const state of ["missing recovery", "missing primary", "corrupt recovery", 
         journal.installed.openai_base_url = "http://127.0.0.1:1/v1";
         writeFileSync(recovery, JSON.stringify(journal));
       }
-      for (const target of [[], ["--claude-only"], ["--subagent-protocol", "native"]]) {
+      for (const target of [[], ["--claude-only"], ["--all-integrations"], ["--subagent-protocol", "native"]]) {
         const result = invoke(["--full", "--zero-risk-browser-interaction", ...target]);
         expect(result.exitCode).not.toBe(0);
         expect(result.stderr).toContain("Zero Risk mode needs its own MCP Tunnel ID");

@@ -76,7 +76,7 @@ test("MCP setup provisions credentials for the requested inactive interaction mo
     tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
     runtimeKey: "new-private-runtime-key",
   });
-  assert.deepEqual(value.invocation().args.slice(4, 6), [
+  assert.deepEqual(value.invocation().args.slice(5, 7), [
     "--zero-risk-browser-interaction", "--replace-codex-route",
   ]);
 });

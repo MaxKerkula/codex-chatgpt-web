@@ -72,6 +72,7 @@ test("core setup preserves an existing full-harness installation", async () => {
       "/runtime/launcher-browser.json",
       "--automatic-browser-interaction",
       "--refresh-account-capabilities",
+    "--codex-only",
     "--replace-codex-route",
     "--acknowledge-unofficial",
     "--restart-service",
@@ -91,6 +92,8 @@ test("core setup starts in browser-only mode when no installation exists", async
   assert.equal(result.mode, "browser-only");
   assert.deepEqual(fixture.invocation().args.slice(0, 2), ["setup", "--browser-only"]);
   assert.equal(fixture.invocation().args.includes("--refresh-account-capabilities"), true);
+  assert.equal(fixture.invocation().args.includes("--codex-only"), true);
+  assert.equal(fixture.invocation().args.includes("--claude-only"), false);
   assert.equal(fixture.invocation().args.includes("--replace-codex-route"), true);
   assert.equal(fixture.invocation().args.includes("--chrome"), false);
 });
@@ -107,6 +110,33 @@ test("launcher setup targets Codex and Claude Code independently", async () => {
   assert.equal(claude.invocation().args.includes("--claude-only"), true);
   assert.equal(claude.invocation().args.includes("--codex-only"), false);
   assert.equal(claude.invocation().args.includes("--replace-codex-route"), true);
+});
+
+test("no launcher setup path installs the Claude Code integration implicitly", async () => {
+  const core = hostFor({ mode: "full", appName: "Codex Native2" });
+  await core.host.setupCore();
+  assert.equal(core.invocation().args.includes("--codex-only"), true);
+  assert.equal(core.invocation().args.includes("--claude-only"), false);
+
+  const mcp = hostFor({ mode: "full", appName: "Codex Native2" });
+  await mcp.host.setupMcp({
+    replace: true,
+    tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+    runtimeKey: "new-private-runtime-key",
+  });
+  assert.equal(mcp.invocation().args.includes("--codex-only"), true);
+  assert.equal(mcp.invocation().args.includes("--claude-only"), false);
+
+  const bigger = hostFor({ mode: "full", appName: "Codex Native2" });
+  await bigger.host.setBiggerContext(true);
+  assert.equal(bigger.invocation().args.includes("--codex-only"), true);
+  assert.equal(bigger.invocation().args.includes("--claude-only"), false);
+
+  const compact = hostFor({ mode: "full", appName: "Codex Native2" });
+  compact.host.bridgeStatus = async () => ({ installed: true, active: true, errors: [] });
+  await compact.host.setExperimentalNoAutoCompact(true);
+  assert.equal(compact.invocation().args.includes("--codex-only"), true);
+  assert.equal(compact.invocation().args.includes("--claude-only"), false);
 });
 
 test("DEV core setup configures only the isolated harness contract", async () => {
@@ -142,6 +172,7 @@ test("Bigger Context uses the setup transaction and refreshes the production Cod
         "--browser-host-descriptor",
         "/runtime/launcher-browser.json",
         "--automatic-browser-interaction",
+        "--codex-only",
         "--replace-codex-route",
       "--acknowledge-unofficial",
       "--restart-service",
@@ -182,6 +213,7 @@ test("experimental no-auto-compact uses setup and requires a Codex restart", asy
       "--browser-host-descriptor",
       "/runtime/launcher-browser.json",
       "--automatic-browser-interaction",
+      "--codex-only",
       "--replace-codex-route",
       "--acknowledge-unofficial",
       "--restart-service",
@@ -336,6 +368,7 @@ test("launcher update transaction upgrades its owned full runtime with saved con
   assert.deepEqual(fixture.invocation().args, [
     "setup",
     "--full",
+    "--codex-only",
     "--browser-host-descriptor",
     "/runtime/launcher-browser.json",
     "--automatic-browser-interaction",
@@ -368,6 +401,7 @@ test("launcher migrates the legacy connector identity even when the release vers
   assert.deepEqual(fixture.invocation().args, [
     "setup",
     "--full",
+    "--codex-only",
     "--browser-host-descriptor",
     "/runtime/launcher-browser.json",
     "--automatic-browser-interaction",
@@ -452,6 +486,7 @@ test("MCP setup reuses valid private credentials without exposing or rewriting t
     assert.deepEqual(fixture.invocation().args, [
       "setup",
       "--full",
+      "--codex-only",
       "--browser-host-descriptor",
       "/runtime/launcher-browser.json",
       "--automatic-browser-interaction",
@@ -474,9 +509,10 @@ test("new MCP setup uses the fixed connector without a CLI name override", async
     runtimeKey: "new-private-runtime-key",
   });
 
-  assert.deepEqual(fixture.invocation().args.slice(0, 5), [
+  assert.deepEqual(fixture.invocation().args.slice(0, 6), [
     "setup",
     "--full",
+    "--codex-only",
     "--browser-host-descriptor",
     "/runtime/launcher-browser.json",
     "--automatic-browser-interaction",

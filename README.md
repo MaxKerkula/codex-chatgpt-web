@@ -197,6 +197,13 @@ and tool calls as standard `tool_use` blocks. Markdown and code fences are passe
 Claude's native `/compact`, recap, resume, and subagent lifecycle remain client-owned; Enhanced mode
 only controls the corresponding Web surface retention and safe continuation.
 
+Installing into Claude Code is always explicit. Everything else in the launcher — core setup, MCP
+setup, the context and compaction toggles, and the runtime upgrade — targets Codex only, and a
+terminal `setup` without an integration target installs Codex only. Add `--claude-only` (or
+`--all-integrations`) when you want the Claude Code integration. An integration that is already
+installed still has its local gateway token refreshed by later Codex setups; nothing installs into
+Claude Code as a side effect.
+
 ## Full harness
 
 Full mode connects ChatGPT's tool calls back to the current Codex task through the official

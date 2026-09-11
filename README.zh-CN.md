@@ -171,6 +171,11 @@ Zero Risk 保留本地 Responses bridge 与完整 Codex harness，但不会读�
 Claude Code 的 root 与 subagent 使用彼此独立的 Web 对话；mid-turn prompt 会附加在正常工具结果
 边界，而不是中断或替换正在进行的工具结果。
 
+安装到 Claude Code 始终是显式操作：启动器的核心设置、MCP 设置、上下文与压缩开关、运行时升级
+都只针对 Codex，不带集成目标的终端 `setup` 也只安装 Codex。需要 Claude Code 集成时请使用
+`--claude-only`（或 `--all-integrations`）。已安装的集成会由后续 Codex 设置刷新其本地 gateway
+token，但不会因副作用再次安装。
+
 桥接会将一般 Web commentary 输出为 Claude `text` 区块，将真正 reasoning 输出为 `thinking`，
 并将工具调用输出为标准 `tool_use`。Markdown 与代码围栏会逐字传递。Claude 原生 `/compact`、
 recap、resume 与 subagent 生命周期仍由客户端管理；Enhanced 模式只管理对应 Web surface 的

@@ -1088,7 +1088,7 @@ class RuntimeHost {
     }
   }
 
-  async setupCore(integration = "all") {
+  async setupCore(integration = "codex") {
     this.assertProductionProfile("Codex integration setup");
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
     if (!new Set(["all", "codex", "claude"]).has(integration)) {
@@ -1183,6 +1183,7 @@ class RuntimeHost {
       "--browser-host-descriptor",
       this.browserDescriptorPath,
       ...this.browserInteractionArgs(),
+      "--codex-only",
       "--replace-codex-route",
       "--acknowledge-unofficial",
       "--restart-service",
@@ -1214,7 +1215,7 @@ class RuntimeHost {
       "--browser-host-descriptor",
       this.browserDescriptorPath,
       ...this.browserInteractionArgs(),
-      ...(this.launcherProfile === "development" ? [] : ["--replace-codex-route"]),
+      ...(this.launcherProfile === "development" ? [] : ["--codex-only", "--replace-codex-route"]),
       "--acknowledge-unofficial",
       ...(this.launcherProfile === "development" ? [] : ["--restart-service"]),
       compactFlag,
@@ -1264,6 +1265,7 @@ class RuntimeHost {
     const args = [
       "setup",
       existing.mode === "full" ? "--full" : "--browser-only",
+      "--codex-only",
       "--browser-host-descriptor",
       this.browserDescriptorPath,
       // A release may repair capability detection. Reusing the previous result can
@@ -1307,6 +1309,9 @@ class RuntimeHost {
     const args = [
       "setup",
       "--full",
+      // The MCP harness is a Codex capability: connecting or reconnecting it must not install the
+      // Claude Code integration. An already-installed Claude integration is still refreshed.
+      "--codex-only",
       "--browser-host-descriptor",
       this.browserDescriptorPath,
       ...this.browserInteractionArgs({ mode: targetMode }),
@@ -1398,7 +1403,7 @@ class RuntimeHost {
       ...this.browserInteractionArgs({ mode: "manual" }),
       "--acknowledge-unofficial", "--standard-context",
       enabled ? "--zero-risk-pro" : "--zero-risk-default",
-      ...(this.launcherProfile === "production" ? ["--replace-codex-route", "--restart-service"] : []),
+      ...(this.launcherProfile === "production" ? ["--codex-only", "--replace-codex-route", "--restart-service"] : []),
     ];
     if (current.config?.autoApproveToolCalls === true) args.push("--auto-approve-tool-calls");
     const options = {
@@ -1423,7 +1428,7 @@ class RuntimeHost {
       "--browser-host-descriptor", this.browserDescriptorPath,
       ...this.browserInteractionArgs({ mode, refreshCapabilities: true }),
       "--acknowledge-unofficial",
-      ...(this.launcherProfile === "production" ? ["--replace-codex-route", "--restart-service"] : []),
+      ...(this.launcherProfile === "production" ? ["--codex-only", "--replace-codex-route", "--restart-service"] : []),
       mode === "automatic" && current.config?.experimentalBiggerContext === true
         ? "--bigger-context" : "--standard-context",
     ];

@@ -49,8 +49,9 @@ test("launcher setup refreshes account capabilities only when missing or explici
   } as never, false, "automatic")).toBe(true);
 });
 
-test("setup can install Codex and Claude Code independently without changing the combined default", () => {
-  expect(setupIntegrationSelection()).toEqual({ codex: true, claude: true });
+test("setup targets Codex only unless a client is selected explicitly", () => {
+  expect(setupIntegrationSelection()).toEqual({ codex: true, claude: false });
   expect(setupIntegrationSelection("codex")).toEqual({ codex: true, claude: false });
   expect(setupIntegrationSelection("claude")).toEqual({ codex: false, claude: true });
+  expect(setupIntegrationSelection("all")).toEqual({ codex: true, claude: true });
 });
